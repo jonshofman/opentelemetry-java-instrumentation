@@ -1,0 +1,13 @@
+apply from: "$rootDir/gradle/instrumentation.gradle"
+
+muzzle {
+  pass {
+    coreJdk()
+  }
+}
+
+dependencies {
+  //library files('jar/core.jar')
+  library group: 'org.lucee', name: 'lucee', version: '5.3.7.47'
+}
+
