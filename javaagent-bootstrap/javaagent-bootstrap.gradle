@@ -7,6 +7,18 @@ apply from: "$rootDir/gradle/publish.gradle"
 minimumBranchCoverage = 0.0
 minimumInstructionCoverage = 0.0
 
+// patch inner class from Caffeine to avoid ForkJoinTask from being loaded too early
+sourceSets {
+  patch {
+    java {}
+  }
+}
+jar {
+  from(sourceSets.patch.output) {
+    include 'io/opentelemetry/instrumentation/api/internal/shaded/caffeine/cache/BoundedLocalCache$PerformCleanupTask.class'
+  }
+}
+
 configurations {
   // classpath used by the instrumentation muzzle plugin
   instrumentationMuzzle {
@@ -28,6 +40,6 @@ dependencies {
   implementation project(':instrumentation-api')
 
   testImplementation project(':testing-common')
-  testImplementation group: 'org.mockito', name: 'mockito-core', version: '3.6.0'
+  testImplementation deps.mockito
   testImplementation deps.assertj
 }

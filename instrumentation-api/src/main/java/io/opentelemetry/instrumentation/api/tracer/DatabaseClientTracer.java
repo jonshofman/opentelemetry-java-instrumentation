@@ -33,17 +33,14 @@ public abstract class DatabaseClientTracer<CONNECTION, STATEMENT, SANITIZEDSTATE
   }
 
   public boolean shouldStartSpan(Context parentContext) {
-    return shouldStartSpan(CLIENT, parentContext);
+    return shouldStartSpan(parentContext, CLIENT);
   }
 
   public Context startSpan(Context parentContext, CONNECTION connection, STATEMENT statement) {
     SANITIZEDSTATEMENT sanitizedStatement = sanitizeStatement(statement);
 
     SpanBuilder span =
-        tracer
-            .spanBuilder(spanName(connection, statement, sanitizedStatement))
-            .setParent(parentContext)
-            .setSpanKind(CLIENT)
+        spanBuilder(parentContext, spanName(connection, statement, sanitizedStatement), CLIENT)
             .setAttribute(SemanticAttributes.DB_SYSTEM, dbSystem(connection));
 
     if (connection != null) {
@@ -83,7 +80,7 @@ public abstract class DatabaseClientTracer<CONNECTION, STATEMENT, SANITIZEDSTATE
       @Nullable String table,
       String defaultValue) {
     if (operation == null) {
-      return dbName == null ? DB_QUERY : dbName;
+      return dbName == null ? defaultValue : dbName;
     }
 
     StringBuilder name = new StringBuilder(operation);

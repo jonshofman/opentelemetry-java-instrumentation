@@ -109,15 +109,15 @@ shadowJar {
 evaluationDependsOn(":testing:agent-for-testing")
 
 tasks.withType(Test).configureEach {
+  inputs.file(shadowJar.archiveFile)
+
   jvmArgs "-Dotel.javaagent.debug=true"
   jvmArgs "-javaagent:${project(":testing:agent-for-testing").tasks.shadowJar.archiveFile.get().asFile.absolutePath}"
-  jvmArgs "-Dotel.initializer.jar=${shadowJar.archiveFile.get().asFile.absolutePath}"
-  jvmArgs "-Dinternal.testing.disable.global.library.ignores=true"
-  // always run with the thread propagation debugger to help track down sporadic test failures
-  jvmArgs "-Dotel.threadPropagationDebugger=true"
-  jvmArgs "-Dotel.internal.failOnContextLeak=true"
+  jvmArgs "-Dotel.javaagent.experimental.initializer.jar=${shadowJar.archiveFile.get().asFile.absolutePath}"
+  jvmArgs "-Dotel.javaagent.testing.additional-library-ignores.enabled=false"
+  jvmArgs "-Dotel.javaagent.testing.fail-on-context-leak=true"
   // prevent sporadic gradle deadlocks, see SafeLogger for more details
-  jvmArgs "-Dotel.internal.enableTransformSafeLogging=true"
+  jvmArgs "-Dotel.javaagent.testing.transform-safe-logging.enabled=true"
 
   dependsOn shadowJar
   dependsOn ":testing:agent-for-testing:shadowJar"
@@ -130,9 +130,13 @@ tasks.withType(Test).configureEach {
     if (file("$buildDir/resources/main").equals(it) || file("$buildDir/classes/java/main").equals(it)) {
       return false
     }
-    // If agent depends on library instrumentation, it will be packaged into the testing jar so we
-    // need to make sure to exclude from the test classpath.
-    if (it.absolutePath.startsWith(file("${projectDir.parent}/library/build/libs").absolutePath)) {
+    // If agent depends on some shared instrumentation module that is not a testing module, it will
+    // be packaged into the testing jar so we need to make sure to exclude from the test classpath.
+    String libPath = it.absolutePath
+    String instrumentationPath = file("${rootDir}/instrumentation/").absolutePath
+    if (libPath.startsWith(instrumentationPath) &&
+      libPath.endsWith(".jar") &&
+      !libPath.substring(instrumentationPath.size()).contains("testing")) {
       return false
     }
     return true

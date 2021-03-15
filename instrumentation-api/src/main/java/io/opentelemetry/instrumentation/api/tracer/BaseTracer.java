@@ -13,7 +13,6 @@ import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Context;
-import io.opentelemetry.context.ContextKey;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.context.propagation.TextMapGetter;
 import io.opentelemetry.context.propagation.TextMapPropagator;
@@ -21,19 +20,28 @@ import io.opentelemetry.context.propagation.TextMapSetter;
 import io.opentelemetry.instrumentation.api.InstrumentationVersion;
 import io.opentelemetry.instrumentation.api.config.Config;
 import io.opentelemetry.instrumentation.api.context.ContextPropagationDebug;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * Base class for all instrumentation specific tracer implementations.
  *
  * <p>Tracers should not use {@link Span} directly in their public APIs: ideally all lifecycle
- * methods (ex. start/end methods) should return/accept {@link Context}.
+ * methods (ex. start/end methods) should return/accept {@link Context}. By convention, {@link
+ * Context} should be passed to all methods as the first parameter.
  *
  * <p>The {@link BaseTracer} offers several {@code startSpan()} utility methods for creating bare
  * spans without any attributes. If you want to provide some additional attributes on span start
- * please consider writing your own specific {@code startSpan()} method in the your tracer.
+ * please consider writing your own specific {@code startSpan()} method in your tracer.
+ *
+ * <p>A {@link Context} returned by any {@code startSpan()} method will <b>always</b> contain a new
+ * span. If there is a need to suppress span creation {@link #shouldStartSpan(Context, SpanKind)}
+ * should be called before {@code startSpan()}.
  *
  * <p>When constructing {@link Span}s tracers should set all attributes available during
  * construction on a {@link SpanBuilder} instead of a {@link Span}. This way {@code SpanProcessor}s
@@ -44,33 +52,11 @@ public abstract class BaseTracer {
   private static final SupportabilityMetrics supportability =
       new SupportabilityMetrics(Config.get()).start();
 
-  // Keeps track of the server span for the current trace.
-  // TODO(anuraaga): Should probably be renamed to local root key since it could be a consumer span
-  // or other non-server root.
-  private static final ContextKey<Span> CONTEXT_SERVER_SPAN_KEY =
-      ContextKey.named("opentelemetry-trace-server-span-key");
-
-  // Keeps track of the client span in a subtree corresponding to a client request.
-  private static final ContextKey<Span> CONTEXT_CLIENT_SPAN_KEY =
-      ContextKey.named("opentelemetry-trace-auto-client-span-key");
-
-  protected final Tracer tracer;
-  protected final ContextPropagators propagators;
+  private final Tracer tracer;
+  private final ContextPropagators propagators;
 
   public BaseTracer() {
     this(GlobalOpenTelemetry.get());
-  }
-
-  /**
-   * Prefer to pass in an OpenTelemetry instance, rather than just a Tracer, so you don't have to
-   * use the GlobalOpenTelemetry Propagator instance.
-   *
-   * @deprecated prefer to pass in an OpenTelemetry instance, instead.
-   */
-  @Deprecated
-  public BaseTracer(Tracer tracer) {
-    this.tracer = tracer;
-    this.propagators = GlobalOpenTelemetry.getPropagators();
   }
 
   public BaseTracer(OpenTelemetry openTelemetry) {
@@ -78,40 +64,40 @@ public abstract class BaseTracer {
     this.propagators = openTelemetry.getPropagators();
   }
 
-  public Context startSpan(Class<?> clazz) {
-    return startSpan(spanNameForClass(clazz));
+  /**
+   * The name of the instrumentation library, not the name of the instrument*ed* library. The value
+   * returned by this method should uniquely identify the instrumentation library so that during
+   * troubleshooting it's possible to pinpoint what tracer produced problematic telemetry.
+   *
+   * <p>In this project we use a convention to encode the version of the instrument*ed* library into
+   * the instrumentation name, for example {@code io.opentelemetry.javaagent.apache-httpclient-4.0}.
+   * This way, if there are different instrumentations for different library versions it's easy to
+   * find out which instrumentations produced the telemetry data.
+   *
+   * @see io.opentelemetry.api.trace.TracerProvider#get(String, String)
+   */
+  protected abstract String getInstrumentationName();
+
+  /**
+   * The version of the instrumentation library - defaults to the value of JAR manifest attribute
+   * {@code Implementation-Version}.
+   */
+  protected String getVersion() {
+    return InstrumentationVersion.VERSION;
   }
 
-  public Context startSpan(Method method) {
-    return startSpan(spanNameForMethod(method));
-  }
-
-  public Context startSpan(String spanName) {
-    return startSpan(spanName, SpanKind.INTERNAL);
-  }
-
-  public Context startSpan(String spanName, SpanKind kind) {
-    return startSpan(Context.current(), spanName, kind);
-  }
-
-  public Context startSpan(Context parentContext, String spanName, SpanKind kind) {
-    Span span = spanBuilder(spanName, kind).setParent(parentContext).startSpan();
-    return parentContext.with(span);
-  }
-
-  protected SpanBuilder spanBuilder(String spanName, SpanKind kind) {
-    return tracer.spanBuilder(spanName).setSpanKind(kind);
-  }
-
-  protected final Context withClientSpan(Context parentContext, Span span) {
-    return parentContext.with(span).with(CONTEXT_CLIENT_SPAN_KEY, span);
-  }
-
-  protected final Context withServerSpan(Context parentContext, Span span) {
-    return parentContext.with(span).with(CONTEXT_SERVER_SPAN_KEY, span);
-  }
-
-  protected final boolean shouldStartSpan(SpanKind proposedKind, Context context) {
+  /**
+   * Returns true if a new span of the {@code proposedKind} should be suppressed.
+   *
+   * <p>If the passed {@code context} contains a {@link SpanKind#SERVER} span the instrumentation
+   * must not create another {@code SERVER} span. The same is true for a {@link SpanKind#CLIENT}
+   * span: if one {@code CLIENT} span is already present in the passed {@code context} then another
+   * one must not be started.
+   *
+   * @see #withClientSpan(Context, Span)
+   * @see #withServerSpan(Context, Span)
+   */
+  public final boolean shouldStartSpan(Context context, SpanKind proposedKind) {
     boolean suppressed = false;
     switch (proposedKind) {
       case CLIENT:
@@ -129,40 +115,85 @@ public abstract class BaseTracer {
     return !suppressed;
   }
 
-  private boolean inClientSpan(Context parentContext) {
-    return parentContext.get(CONTEXT_CLIENT_SPAN_KEY) != null;
+  private boolean inClientSpan(Context context) {
+    return ClientSpan.fromContextOrNull(context) != null;
   }
 
   private boolean inServerSpan(Context context) {
-    return getCurrentServerSpan(context) != null;
+    return ServerSpan.fromContextOrNull(context) != null;
   }
 
-  protected abstract String getInstrumentationName();
+  /**
+   * Returns a {@link Context} inheriting from {@code Context.current()} that contains a new span
+   * with name {@code spanName} and kind {@link SpanKind#INTERNAL}.
+   */
+  public Context startSpan(String spanName) {
+    return startSpan(spanName, SpanKind.INTERNAL);
+  }
 
-  protected String getVersion() {
-    return InstrumentationVersion.VERSION;
+  /**
+   * Returns a {@link Context} inheriting from {@code Context.current()} that contains a new span
+   * with name {@code spanName} and kind {@code kind}.
+   */
+  public Context startSpan(String spanName, SpanKind kind) {
+    return startSpan(Context.current(), spanName, kind);
+  }
+
+  /**
+   * Returns a {@link Context} inheriting from {@code parentContext} that contains a new span with
+   * name {@code spanName} and kind {@code kind}.
+   */
+  public Context startSpan(Context parentContext, String spanName, SpanKind kind) {
+    Span span = spanBuilder(parentContext, spanName, kind).startSpan();
+    return parentContext.with(span);
+  }
+
+  /** Returns a {@link SpanBuilder} to create and start a new {@link Span}. */
+  protected final SpanBuilder spanBuilder(Context parentContext, String spanName, SpanKind kind) {
+    return tracer.spanBuilder(spanName).setSpanKind(kind).setParent(parentContext);
+  }
+
+  /**
+   * Returns a {@link Context} containing the passed {@code span} marked as the current {@link
+   * SpanKind#CLIENT} span.
+   *
+   * @see #shouldStartSpan(Context, SpanKind)
+   */
+  protected final Context withClientSpan(Context parentContext, Span span) {
+    return ClientSpan.with(parentContext.with(span), span);
+  }
+
+  /**
+   * Returns a {@link Context} containing the passed {@code span} marked as the current {@link
+   * SpanKind#SERVER} span.
+   *
+   * @see #shouldStartSpan(Context, SpanKind)
+   */
+  protected final Context withServerSpan(Context parentContext, Span span) {
+    return ServerSpan.with(parentContext.with(span), span);
   }
 
   /**
    * This method is used to generate an acceptable span (operation) name based on a given method
    * reference. Anonymous classes are named based on their parent.
    */
-  public String spanNameForMethod(Method method) {
+  public static String spanNameForMethod(Method method) {
     return spanNameForMethod(method.getDeclaringClass(), method.getName());
   }
 
   /**
    * This method is used to generate an acceptable span (operation) name based on a given method
    * reference. Anonymous classes are named based on their parent.
-   *
-   * @param method the method to get the name from, nullable
-   * @return the span name from the class and method
    */
-  protected String spanNameForMethod(Class<?> clazz, Method method) {
-    return spanNameForMethod(clazz, null == method ? null : method.getName());
+  public static String spanNameForMethod(Class<?> clazz, @Nullable Method method) {
+    return spanNameForMethod(clazz, method == null ? "<unknown>" : method.getName());
   }
 
-  protected String spanNameForMethod(Class<?> cl, String methodName) {
+  /**
+   * This method is used to generate an acceptable span (operation) name based on a given method
+   * reference. Anonymous classes are named based on their parent.
+   */
+  public static String spanNameForMethod(Class<?> cl, String methodName) {
     return spanNameForClass(cl) + "." + methodName;
   }
 
@@ -170,7 +201,7 @@ public abstract class BaseTracer {
    * This method is used to generate an acceptable span (operation) name based on a given class
    * reference. Anonymous classes are named based on their parent.
    */
-  public String spanNameForClass(Class<?> clazz) {
+  public static String spanNameForClass(Class<?> clazz) {
     if (!clazz.isAnonymousClass()) {
       return clazz.getSimpleName();
     }
@@ -178,21 +209,24 @@ public abstract class BaseTracer {
     if (clazz.getPackage() != null) {
       String pkgName = clazz.getPackage().getName();
       if (!pkgName.isEmpty()) {
-        className = clazz.getName().replace(pkgName, "").substring(1);
+        className = className.substring(pkgName.length() + 1);
       }
     }
     return className;
   }
 
+  /** Ends the execution of a span stored in the passed {@code context}. */
   public void end(Context context) {
     end(context, -1);
   }
 
+  /**
+   * Ends the execution of a span stored in the passed {@code context}.
+   *
+   * @param endTimeNanos Explicit nanoseconds timestamp from the epoch.
+   */
   public void end(Context context, long endTimeNanos) {
-    end(Span.fromContext(context), endTimeNanos);
-  }
-
-  private void end(Span span, long endTimeNanos) {
+    Span span = Span.fromContext(context);
     if (endTimeNanos > 0) {
       span.end(endTimeNanos, TimeUnit.NANOSECONDS);
     } else {
@@ -200,32 +234,62 @@ public abstract class BaseTracer {
     }
   }
 
+  /**
+   * Records the {@code throwable} in the span stored in the passed {@code context} and marks the
+   * end of the span's execution.
+   *
+   * @see #onException(Context, Throwable)
+   * @see #end(Context)
+   */
   public void endExceptionally(Context context, Throwable throwable) {
     endExceptionally(context, throwable, -1);
   }
 
+  /**
+   * Records the {@code throwable} in the span stored in the passed {@code context} and marks the
+   * end of the span's execution.
+   *
+   * @param endTimeNanos Explicit nanoseconds timestamp from the epoch.
+   * @see #onException(Context, Throwable)
+   * @see #end(Context, long)
+   */
   public void endExceptionally(Context context, Throwable throwable, long endTimeNanos) {
-    endExceptionally(Span.fromContext(context), throwable, endTimeNanos);
+    onException(context, throwable);
+    end(context, endTimeNanos);
   }
 
-  private void endExceptionally(Span span, Throwable throwable, long endTimeNanos) {
+  /**
+   * Records the {@code throwable} in the span stored in the passed {@code context} and sets the
+   * span's status to {@link StatusCode#ERROR}. The throwable is unwrapped ({@link
+   * #unwrapThrowable(Throwable)}) before being added to the span.
+   */
+  public void onException(Context context, Throwable throwable) {
+    Span span = Span.fromContext(context);
     span.setStatus(StatusCode.ERROR);
-    onError(span, unwrapThrowable(throwable));
-    end(span, endTimeNanos);
+    span.recordException(unwrapThrowable(throwable));
   }
 
-  protected void onError(Span span, Throwable throwable) {
-    addThrowable(span, throwable);
-  }
-
+  /**
+   * Extracts the actual cause by unwrapping passed {@code throwable} from known wrapper exceptions,
+   * e.g {@link ExecutionException}.
+   */
   protected Throwable unwrapThrowable(Throwable throwable) {
-    return throwable instanceof ExecutionException ? throwable.getCause() : throwable;
+    if (throwable.getCause() != null
+        && (throwable instanceof ExecutionException
+            || throwable instanceof CompletionException
+            || throwable instanceof InvocationTargetException
+            || throwable instanceof UndeclaredThrowableException)) {
+      return unwrapThrowable(throwable.getCause());
+    }
+    return throwable;
   }
 
-  public void addThrowable(Span span, Throwable throwable) {
-    span.recordException(throwable);
-  }
-
+  /**
+   * Extracts a {@link Context} from {@code carrier} using the propagator embedded in this tracer.
+   * This method can be used to propagate {@link Context} passed from upstream services.
+   *
+   * @see TextMapPropagator#extract(Context, Object, TextMapGetter)
+   */
   public <C> Context extract(C carrier, TextMapGetter<C> getter) {
     ContextPropagationDebug.debugContextLeakIfEnabled();
 
@@ -243,15 +307,5 @@ public abstract class BaseTracer {
    */
   public <C> void inject(Context context, C carrier, TextMapSetter<C> setter) {
     propagators.getTextMapPropagator().inject(context, carrier, setter);
-  }
-
-  /** Returns span of type SERVER from the current context or <code>null</code> if not found. */
-  public static Span getCurrentServerSpan() {
-    return getCurrentServerSpan(Context.current());
-  }
-
-  /** Returns span of type SERVER from the given context or <code>null</code> if not found. */
-  public static Span getCurrentServerSpan(Context context) {
-    return context.get(CONTEXT_SERVER_SPAN_KEY);
   }
 }
